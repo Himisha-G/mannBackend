@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+requests
+google-generativeai
+langchain-core>=0.1.52
+langgraph
+langchain-google-genai
