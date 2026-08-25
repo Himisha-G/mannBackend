@@ -32,7 +32,7 @@ def create_graph(system_prompt: str):
     if not os.getenv("GOOGLE_API_KEY"):
         raise ValueError("GOOGLE_API_KEY environment variable is not set.")
         
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.9)
+    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.9)
     
     def chatbot_node(state: AgentState):
         """The core LLM invocation node."""
