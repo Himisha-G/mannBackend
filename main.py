@@ -1,4 +1,4 @@
-
+import os
 import asyncio
 import time
 import secrets
@@ -79,6 +79,36 @@ if not JUDGE_ACCESS_CODE:
 SESSIONS: dict[str, dict] = {}
 MAX_REQUESTS_PER_SESSION = 50
 SESSION_TTL_SECONDS = 6 * 60 * 60
+
+
+# ---------------------------------------------------------
+# FREE-TIER MESSAGE LIMIT
+# ---------------------------------------------------------
+#
+# Everyone gets a small number of free messages on YOUR Gemini
+# keys with no login/code needed. Once a given user_uuid uses
+# them up, /chat starts returning 402 FREE_LIMIT_REACHED, and
+# the frontend asks them for their own (free) Gemini API key to
+# keep going. Judge access codes and own-keys are unlimited and
+# don't touch this counter at all.
+#
+# This is in-memory, same as SESSIONS above, so it resets on
+# redeploy/restart. That's fine for this use case.
+
+FREE_MESSAGE_LIMIT = int(os.getenv("FREE_MESSAGE_LIMIT", "15"))
+
+FREE_USAGE: dict[str, int] = {}
+
+
+def get_free_remaining(user_uuid: str) -> int:
+    used = FREE_USAGE.get(user_uuid, 0)
+    return max(FREE_MESSAGE_LIMIT - used, 0)
+
+
+def record_free_usage(user_uuid: str) -> int:
+    """Increments usage for this user_uuid and returns remaining count."""
+    FREE_USAGE[user_uuid] = FREE_USAGE.get(user_uuid, 0) + 1
+    return get_free_remaining(user_uuid)
 
 
 def create_session() -> str:
@@ -629,6 +659,7 @@ async def root():
         },
         "gemini_keys_configured": len(GEMINI_API_KEYS),
         "graphs_loaded": len(GRAPH_CACHE),
+        "free_message_limit": FREE_MESSAGE_LIMIT,
     }
 
 
@@ -642,6 +673,24 @@ async def health():
         "status": "healthy",
         "gemini_keys_configured": len(GEMINI_API_KEYS),
         "graphs_loaded": len(GRAPH_CACHE),
+    }
+
+
+# ---------------------------------------------------------
+# FREE MESSAGE USAGE (for a given user_uuid)
+# ---------------------------------------------------------
+
+@app.get("/free-usage")
+async def free_usage(user_uuid: str):
+    """
+    Lets the frontend check how many free messages a user has left
+    without spending one. Used to show a "X free messages left" note
+    and to decide whether to show the upgrade modal on page load.
+    """
+
+    return {
+        "remaining": get_free_remaining(user_uuid),
+        "limit": FREE_MESSAGE_LIMIT,
     }
 
 
@@ -806,7 +855,7 @@ async def invoke_new_message(data: ChatInput):
     )
 
     # -----------------------------------------------------
-    # Route 1: user's own Gemini API key
+    # Route 1: user's own Gemini API key (unlimited, their quota)
     # -----------------------------------------------------
     if data.user_api_key:
         history = await invoke_with_user_key(
@@ -822,7 +871,7 @@ async def invoke_new_message(data: ChatInput):
         }
 
     # -----------------------------------------------------
-    # Route 2: judge session -> server-side Gemini keys
+    # Route 2: judge/access-code session -> unlimited, server keys
     # -----------------------------------------------------
     if data.access_token:
         validate_session(data.access_token)
@@ -852,12 +901,50 @@ async def invoke_new_message(data: ChatInput):
             )
 
     # -----------------------------------------------------
-    # No access supplied
+    # Route 3: free tier -> server keys, up to FREE_MESSAGE_LIMIT
     # -----------------------------------------------------
-    raise HTTPException(
-        status_code=401,
-        detail="Provide an access code or your own Gemini API key.",
-    )
+    remaining = get_free_remaining(data.user_uuid)
+
+    if remaining <= 0:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "FREE_LIMIT_REACHED",
+                "message": (
+                    f"You've used all {FREE_MESSAGE_LIMIT} free messages. "
+                    "Add your own free Gemini API key to keep chatting."
+                ),
+                "limit": FREE_MESSAGE_LIMIT,
+            },
+        )
+
+    try:
+        history = await invoke_with_failover(
+            thread_id=thread_id,
+            zone_name=data.zone_name,
+            prompt=data.prompt,
+        )
+
+        remaining_after = record_free_usage(data.user_uuid)
+
+        return {
+            "thread_id": thread_id,
+            "messages": history,
+            "free_remaining": remaining_after,
+            "free_limit": FREE_MESSAGE_LIMIT,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Chat request failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The chatbot is temporarily unavailable. "
+                "Please try again in a moment."
+            ),
+        )
 
 
 # ---------------------------------------------------------
@@ -918,6 +1005,10 @@ async def startup_event():
     print(
         f"🔑 Gemini keys configured: "
         f"{len(GEMINI_API_KEYS)}"
+    )
+    print(
+        f"🎟️ Free messages per user: {FREE_MESSAGE_LIMIT} "
+        f"(set FREE_MESSAGE_LIMIT to change)"
     )
 
     # We deliberately don't create every graph here.
