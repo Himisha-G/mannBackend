@@ -1,7 +1,9 @@
-import os
+
 import asyncio
 import time
 import secrets
+import urllib.request
+import urllib.error
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -59,28 +61,24 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------
-# ACCESS CONTROL (judge access code + per-session rate limiting)
+# ACCESS CONTROL
 # ---------------------------------------------------------
 #
-# Two ways a request is allowed to use the chatbot:
+# Judges can enter JUDGE_ACCESS_CODE and receive a temporary
+# session token. That token lets the server use the Gemini keys
+# stored in Render without exposing those keys to the browser.
 #
-#   1. access_token  -> obtained via /verify-access using
-#                        JUDGE_ACCESS_CODE. Uses YOUR server-side
-#                        Gemini keys, rate-limited per session.
-#
-#   2. user_api_key  -> the caller's own Gemini API key. Never
-#                        touches your quota, no rate limit applied.
+# Other users can supply their own Gemini API key. Their requests
+# use only their key and do not consume your server-side quota.
 
 JUDGE_ACCESS_CODE = os.getenv("JUDGE_ACCESS_CODE")
 
 if not JUDGE_ACCESS_CODE:
-    print("⚠️  JUDGE_ACCESS_CODE not set — judge access code login will be disabled.")
+    print("WARNING: JUDGE_ACCESS_CODE is not set. Judge access is disabled.")
 
-# token -> { "created": timestamp, "count": int }
 SESSIONS: dict[str, dict] = {}
-
-MAX_REQUESTS_PER_SESSION = 50          # total requests a judge session can make
-SESSION_TTL_SECONDS = 6 * 60 * 60      # sessions expire after 6 hours
+MAX_REQUESTS_PER_SESSION = 50
+SESSION_TTL_SECONDS = 6 * 60 * 60
 
 
 def create_session() -> str:
@@ -90,11 +88,13 @@ def create_session() -> str:
 
 
 def validate_session(token: str) -> None:
-    """Raises HTTPException if the token is missing, expired, or over quota."""
     session = SESSIONS.get(token)
 
     if not session:
-        raise HTTPException(status_code=401, detail="Invalid or expired access session.")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired access session.",
+        )
 
     if time.time() - session["created"] > SESSION_TTL_SECONDS:
         SESSIONS.pop(token, None)
@@ -563,14 +563,7 @@ async def invoke_with_user_key(
     prompt: str,
     user_api_key: str,
 ):
-    """
-    Sends a message using a Gemini key supplied by the caller.
-
-    No failover here — it's the caller's own quota, not ours.
-    The graph is built fresh each call rather than cached, since
-    caching by arbitrary user-submitted keys would let the cache
-    grow unbounded.
-    """
+    """Use only the Gemini key supplied by this caller."""
 
     system_prompt = get_system_prompt(zone_name)
 
@@ -579,16 +572,20 @@ async def invoke_with_user_key(
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail="Could not use that Gemini API key. Double-check it's correct and active.",
+            detail="Could not use that Gemini API key. Double-check it is correct and active.",
         ) from e
 
     try:
-        result = await asyncio.to_thread(invoke_chat, thread_id, prompt, graph)
-        return result
+        return await asyncio.to_thread(
+            invoke_chat,
+            thread_id,
+            prompt,
+            graph,
+        )
     except Exception as e:
         raise HTTPException(
             status_code=502,
-            detail="Gemini rejected the request — check your API key and quota.",
+            detail="Gemini rejected the request. Check your API key and quota.",
         ) from e
 
 
@@ -611,6 +608,10 @@ class ChatHistoryInput(BaseModel):
 
 class VerifyAccessInput(BaseModel):
     password: str
+
+
+class VerifyApiKeyInput(BaseModel):
+    api_key: str
 
 
 # ---------------------------------------------------------
@@ -645,17 +646,11 @@ async def health():
 
 
 # ---------------------------------------------------------
-# VERIFY ACCESS (judge access code -> session token)
+# VERIFY JUDGE ACCESS CODE
 # ---------------------------------------------------------
 
 @app.post("/verify-access")
 async def verify_access(data: VerifyAccessInput):
-    """
-    Exchanges the judge access code for a short-lived, rate-limited
-    session token. The token is what the frontend then sends as
-    `access_token` on /chat requests.
-    """
-
     if not JUDGE_ACCESS_CODE or data.password != JUDGE_ACCESS_CODE:
         raise HTTPException(status_code=401, detail="Invalid access code")
 
@@ -665,6 +660,60 @@ async def verify_access(data: VerifyAccessInput):
         "success": True,
         "access_token": token,
     }
+
+
+# ---------------------------------------------------------
+# VERIFY USER GEMINI API KEY
+# ---------------------------------------------------------
+
+@app.post("/verify-api-key")
+async def verify_api_key(data: VerifyApiKeyInput):
+    """
+    Checks the supplied Gemini key against Google's models endpoint.
+    No model generation is performed, so entering a key here does not
+    consume a generation request.
+    """
+
+    api_key = data.api_key.strip()
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key cannot be empty.")
+
+    def check_key():
+        request = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": api_key},
+            method="GET",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return None
+
+    status = await asyncio.to_thread(check_key)
+
+    if status == 200:
+        return {"valid": True}
+
+    if status in (401, 403):
+        raise HTTPException(
+            status_code=401,
+            detail="Gemini rejected this API key. Make sure the key is active and has Gemini API access.",
+        )
+
+    if status == 429:
+        # The key may be valid but temporarily rate limited. Let the user
+        # continue; the actual chat request will use the user's quota.
+        return {"valid": True}
+
+    raise HTTPException(
+        status_code=502,
+        detail="Could not verify the Gemini API key right now. Please try again.",
+    )
 
 
 # ---------------------------------------------------------
@@ -741,20 +790,7 @@ async def get_history(data: ChatHistoryInput):
 
 @app.post("/chat")
 async def invoke_new_message(data: ChatInput):
-    """
-    Sends a new message to GuideBot ('home') or FriendBot ('chill').
-
-    Access is granted one of two ways:
-
-      1. data.user_api_key -> caller's own Gemini key. Used directly,
-         no failover, doesn't touch server-side quota.
-
-      2. data.access_token -> a session token obtained from
-         /verify-access. Uses the server's Gemini keys with
-         automatic failover, subject to a per-session rate limit.
-
-    If neither is provided, the request is rejected.
-    """
+    """Send a FriendBot/GuideBot message using the selected access mode."""
 
     if not data.prompt.strip():
         raise HTTPException(
@@ -762,7 +798,6 @@ async def invoke_new_message(data: ChatInput):
             detail="Prompt cannot be empty.",
         )
 
-    # Validates zone_name early (raises 404 if invalid).
     get_system_prompt(data.zone_name)
 
     thread_id = get_or_create_thread_id(
@@ -770,9 +805,9 @@ async def invoke_new_message(data: ChatInput):
         data.zone_name,
     )
 
-    # -------------------------------------------------
-    # Route 1: user's own Gemini key — never touches your quota
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # Route 1: user's own Gemini API key
+    # -----------------------------------------------------
     if data.user_api_key:
         history = await invoke_with_user_key(
             thread_id=thread_id,
@@ -786,9 +821,9 @@ async def invoke_new_message(data: ChatInput):
             "messages": history,
         }
 
-    # -------------------------------------------------
-    # Route 2: judge access token — server-side keys, rate-limited
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # Route 2: judge session -> server-side Gemini keys
+    # -----------------------------------------------------
     if data.access_token:
         validate_session(data.access_token)
 
@@ -806,11 +841,8 @@ async def invoke_new_message(data: ChatInput):
 
         except HTTPException:
             raise
-
         except Exception as e:
-
-            print(f"💥 Chat request failed: {e}")
-
+            print(f"Chat request failed: {e}")
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -819,9 +851,9 @@ async def invoke_new_message(data: ChatInput):
                 ),
             )
 
-    # -------------------------------------------------
-    # Neither provided
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # No access supplied
+    # -----------------------------------------------------
     raise HTTPException(
         status_code=401,
         detail="Provide an access code or your own Gemini API key.",
